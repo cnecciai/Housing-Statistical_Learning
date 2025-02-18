@@ -1,0 +1,581 @@
+---
+title: "Stat 1361 - Final Project on Predicting Housing Prices"
+author: "Clark P. Necciai"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+## Exploratory Data Analysis and Predictions
+
+#### Import Libraries for EDA
+
+```{r, warning = FALSE, message = FALSE}
+#Required Libraries
+library(tidyverse)
+library(ggplot2)
+library(ggpubr)
+library(car)
+library(ggcorrplot)
+library(caret)
+library(glmnet)
+library(pls)
+library(car)
+```
+
+#### Import Training Data Set 
+
+```{r}
+housingData <- read.csv("train.csv", sep = ",", header = TRUE)
+housingData %>% glimpse()
+```
+
+**Missing Values:  **
+
+Before doing anything else, we identify if there are any missing values and deal with them accordingly. In this data set, we have no missing values. 
+
+```{r}
+#No missing values 
+sum(is.na(housingData))
+```
+
+The only variable which should be noted as not providing any useful information will be `id`, as it is merely a unique identifier and so we'll discard it for now. Aside from that, we see that we have character variables such as `desc`, `exteriorfinish`, `rooftype`, and `Location`, which should be converted to factors. 
+
+```{r}
+housingData <- housingData %>% select(-id) %>% mutate_if(is.character, as.factor)
+sapply(housingData, class)
+```
+
+#### Distributions of Values   
+
+We begin by merely observing our data set and each variables corresponding values. First and foremost, we observe that the response is highly skewed and will transform it to approach normality. 
+
+---   
+
+**Note - It is important to remember that we will be predicting the log(natural log) transformed response from now on but for explanatory sake we will continue investigating our normal response, `price` (not logprice). After making our predictions, we can use exp() to transform our data back into standard units(dollars)**    
+
+--- 
+
+Quickly using `shapiro.test()` we can without a doubt confirm that our dataset is highly skewed and in need of a transformation.   
+
+```{r}
+#Response is absolutely right skewed at the moment
+shapiro.test(housingData$price)
+```
+
+```{r}
+resp <- housingData %>% ggplot(aes(price, fill = "red")) +
+  geom_density(alpha = 0.35) +
+  theme(legend.position = "none") +
+  labs(title = "Distribution of Response - Price")  +
+  ylab("Density")  +
+  xlab("Price")
+
+housingData$logprice <- log(housingData$price)
+logresp <- housingData %>% ggplot(aes(logprice, fill = "red")) +
+  geom_density(alpha = 0.25) +
+  theme(legend.position = "none") +
+  labs(title = "Distribution of Response - Log Price") +
+  ylab("Density") +
+  xlab("Log(Price)")
+```
+
+After transformation, though our response is not perfectly normal, our QQ-Plot shows us that it is certainly more so than previously. 
+
+```{r}
+ggarrange(resp, logresp)
+qqPlot(housingData$logprice, main = "QQ-Plot for Log Response", ylab = "Log Response")
+```
+
+#### Outliers in the Response  
+
+We see that even after our transformation, we have response values which are classified as outliers. Below are the two observations which we will remove due to their extremely high response values. While we may come to see more outliers for individual variables as we continue, it would be unwise to begin arbitrarily removing observations from this dataset. We already have relatively few observations in my opinion, and unwisely removing arbitrary observations may cost us unnecessary information loss.   
+
+Additionally, we have some observations which have particularly rare attributes/styles(log, concrete, metal, mobile home, etc). We may be better off keeping those observations for now due in part to these factors. Variables such as `lotarea` do have many outliers, but in an attempt to retain as much information as possible, for now, we will choose to retain these observations.   
+
+
+```{r, fig.width=12}
+#Obtain indeces which are the outliers
+out <- boxplot.stats(housingData$logprice)$out
+out_ind <- which(housingData$logprice %in% c(out))
+
+out <- housingData %>% ggplot(aes(y = logprice)) +
+  geom_boxplot(outlier.color = "red") +
+  labs(title = "Distribution of Response (logprice)", subtitle = "Observations: 189 & 352") +
+  theme( axis.text.y = element_blank()) +
+  coord_flip() 
+
+#Removing the high-value outliers
+housingData <- housingData[-c(out_ind),] 
+ggarrange(out)
+```   
+
+**Next, we look at our factor variables and try to understand their influence on the response**
+
+```{r}
+plot_distribution <- function(data, variable, xlab, title) {
+  ggplot(data, mapping = aes(variable)) +
+    geom_bar(color = 'black', fill = 'white', size = 0.5) +
+    geom_text(stat = 'count',
+              mapping = aes(label = after_stat(count)),
+              color = 'black',
+              nudge_y = 15,
+              size = 3) +
+    xlab(xlab) + 
+    theme_bw() +
+    labs(title = title)
+}
+```
+
+
+```{r, fig.width=10, fig.height=5, warning = FALSE, message = FALSE}
+# GGPLOT of Residential Type
+descgg <- plot_distribution(housingData, housingData$desc, "Description", "Distribution of Residential Type/Description")
+
+exteriorgg <- plot_distribution(housingData, housingData$exteriorfinish, "Exterior", "Distribution of Exterior Types")
+
+roofTypegg <- plot_distribution(housingData, housingData$rooftype, "Roof Type", "Distribution of Rooftype")
+
+locationgg <- plot_distribution(housingData, housingData$Location, "Location", "Distribution of Locations")
+
+ggarrange(descgg, exteriorgg, roofTypegg, locationgg, nrow = 2, ncol = 2)
+```
+
+#### Notes on distribution of factor variables  
+
+- We can clearly note that the vast majority of our our observations($\approx 85\%$) tend to be **single family** homes.  
+
+- For our exterior finishes, we see that the **brick** and **frame** exterior also dominate the other types at $\approx 51\%$ and $\approx 40\%$ respectively.
+
+- The **shingle** type also dominates at $\approx 84\%$ of types of roofing.  
+
+- Lastly, we can see that the majority of our observations come from **location** outside the city ($\approx 65\%$), a moderate amount coming from partly in the city($\approx 28\%$), and the remaining coming from within the city$\approx 7\%$.  
+
+
+#### Discrete Values of `totalrooms`, `basement`, `fireplaces`, and `numstories`
+
+```{r}
+
+totrooms <- plot_distribution(housingData, housingData$totalrooms, "Number of Rooms", "Distribution of Number of Rooms") + 
+      geom_vline(xintercept = mean(housingData$totalrooms), color = "red", linetype = "dashed")
+
+base <- plot_distribution(housingData, housingData$basement, "Basement in Residence (1/Yes)", "Distribution of Basements") + 
+      geom_vline(xintercept = mean(housingData$basement), color = "red", linetype = "dashed")
+
+fire <- plot_distribution(housingData, housingData$fireplaces, "Number of Fireplaces", "Distribution of Fireplaces") + 
+      geom_vline(xintercept = mean(housingData$fireplaces), color = "red", linetype = "dashed")
+
+stor <- plot_distribution(housingData, housingData$numstories, "Number of Stories", "Distribution of Stories") + 
+      geom_vline(xintercept = mean(housingData$numstories), color = "red", linetype = "dashed")
+
+ggarrange(totrooms, base, fire, stor, nrow = 2, ncol = 2)
+```
+
+Our trends speak for themselves. We see the majority of residences have fewer number of rooms, fireplaces, and number of stories. There is a notable unbalance between houses with and without basements, with the majority of residences having basements.   
+
+
+Oddly enough, we see that some observations have values for `numstories` such as 1.7 and 2.8. While it's reasonable to assume there is a description of the integer and half values for stories, these two observations seem out of place. However, given that there are merely two observations with these values, we should proceed under the assumption that they will not make the difference in the long run.   
+
+
+```{r}
+unique(housingData$numstories)
+``` 
+
+**We have 32 distinct bars/zip-codes, each with their corresponding counts in the freq table below**  
+
+```{r}
+#Notice how our data seems to be segregated... this is because we have our data grouped by particular zip codes
+plot_distribution(housingData, housingData$DistDowntown, "Distance to Downtown", "Segregated Distribution of Distances to Downtown")
+
+#We have a total of 32 distinct zip codes. Now the previous chart makes sense as to why our zip codes would be segregated like that. 
+housingData %>% count(zipcode)
+```
+
+##### Observations where `lotarea` == 0 
+
+For twenty-nine of the condominium type residencies, we found that the `lotarea` actually have a value of 0. It is more than likely the case that this was either intentionally or mistakenly done. 
+
+```{r}
+print(paste("Number of observations where lotarea = 0: ", nrow(housingData[which(housingData$lotarea == 0), ])))
+```
+
+---  
+
+### Examining Trends 
+
+**Primary variable being examined: totalrooms**  
+
+Our intuition tells us that as the number of rooms in a residence increases, so would the price. This is exactly what we see in the dataset with very few exceptions. There do appear to be some initial oddities when observing houses that contain 3, 14, and 16 rooms.  
+
+
+- Residences which contain 14 and 16 rooms seemingly break the naturally occurring upwards trend of prices and fall below where we would normally expect. Residences which contain 3 rooms actually have mean distribution of prices that are above those with 4, 5, and 6 rooms (nearly on par with 7).  
+
+This oddity might be explained by confounding variables not yet explored. One major factor not considered is `location`'s influence on the price of the residence. We will see if we can parse the reasoning as to why these distributions are behaving in this way.  
+
+```{r, fig.width=12}
+housingData %>% 
+  ggplot(mapping = aes(x = factor(totalrooms), y = price)) +
+  geom_boxplot(aes(fill = factor(totalrooms)), alpha = 0.5) +
+  stat_summary(fun.y=mean, geom="point", shape=1, size=2, color="red", fill="red") +
+  xlab("Total Amount of Rooms Per Residence") +
+  ylab("Price") +
+  theme(axis.text.y=element_blank()) +
+  labs(title = "Number of Rooms Affect on Price", fill = "Num of Rooms")
+```
+
+
+```{r, fig.width=12}
+housingData %>% 
+  ggplot(mapping = aes(x = factor(totalrooms), y = price)) +
+    geom_boxplot(aes(fill = factor(totalrooms)), alpha = 0.5) +
+    stat_summary(fun.y=mean, geom="point", shape=1, size=2, color="red", fill="red") +
+    ylab("Price") +
+    xlab("Rooms Per Residence") +
+    theme(axis.text.y=element_blank(), axis.text.x = element_blank()) +
+    facet_wrap(~Location, scales = "free") +
+    labs(title = "Number of Rooms Affect on Price When Considering Location", fill = "Num of Rooms")
+```
+
+We now have a slightly more informed understanding as to why these distributions were behaving previously. When we account for `Location`, we can see that those residences that are partly or in the city are pulling the distribution of prices up for residences with 3 rooms.  These distributions broken down by `location` explain why our collapsed distribution from above for `totalrooms` equaling 3 is pulled upwards.  
+
+Likewise, we can see that for rooms of size 16, only residences that were not in **NotCity** contributed to the distribution.  Only **NotCity** and **PartCity** observations contained values for residences with 14 rooms.  
+
+**Note: Now `prices` related to `location` within the city(see below distribution) have wildly varying distributions more than likely caused by very few observations of those values and other confounding variables.**
+
+```{r}
+plot_housing_data <- function(data, xvar, yvar, fillvar, title) {
+  ggplot(data = data, aes_string(x = xvar, y = yvar, fill = fillvar)) +
+    geom_boxplot(alpha = 0.5) +
+    stat_summary(fun.y=mean, geom="point", shape=1, size=2, color="red", fill="red") +
+    theme(axis.text.y = element_blank(), axis.text.x = element_blank()) +
+    labs(title = title, fill = fillvar) +
+    xlab(xvar) +
+    ylab(yvar)
+}
+extgg <- plot_housing_data(housingData, "exteriorfinish", "price", "exteriorfinish", "Exterior Finish Affect on Price")
+descgg <- plot_housing_data(housingData, "desc", "price", "desc", "Description Affect on Price")
+locgg <- plot_housing_data(housingData, "Location", "price", "Location", "Location Affect on Price")
+roofgg <- plot_housing_data(housingData, "rooftype", "price", "rooftype", "Roof Type Affect on Price")
+```
+
+Further inspecting our other factors, we can note very few, minor impacts on price made by exterior finish, the description, the location, and the roof type when examined independently. 
+
+For example:  
+
+- Log type exterior finishes appear to have a higher mean price. However, given the fact that there is only a single observation actually contributing to this statistic, is is an unreliable distribution at best. Stone and Stucco, despite also consisting of relatively few observations, do however appear to have more stable mean estimates of price.   
+
+- `Location` helped to increase our understanding of our oddities above, yet independent of any other variables, it is not a good indicator of price. The mean 
+price response is about equivalent across all types of `Location`. `NotCity` locations tend to have a high number of outlier observations leading us to 
+believe that many, many of the response values of these residence types consist of lower value homes. 
+
+- Metal roofs have quite a high mean response value. However, we know that only two of 698 remaining observations
+consist of metal roofs and should approach this distribution with skepticism. Within the two observations, there exists an observation with a price of $\$2,220,000$ and the other with $\$27,000$. Clearly, these observations are stretching the distribution as we see and might cause us to misknowingly believe that metal roofs are an indicator of high price if we weren't able to delve deeper into the reasoning above as to why.  
+
+- Concrete as an exterior finish, while having 4 observations attributing it's attributing to, should still be seen as unreliable at best.  
+
+
+```{r, fig.width=10, fig.height=8}
+ggarrange(extgg, descgg, locgg, roofgg, nrow = 2, ncol = 2)
+```  
+
+We can see taking a quick glance at the data consisting of our metal `rooftype` that
+
+```{r}
+housingData %>% filter(rooftype == "METAL") %>% select(price, rooftype)
+```
+
+- Multi-family homes also appear to have a higher mean price association. It should be noted that multi-family residences more than likely already consist of 
+many rooms which are typically related to higher prices as noted above. This is exactly what we see when we distinguish single-family and multi-family homes from the other distributions.  
+
+Marking the same point of the mean response (`red cross`) for each of the `desc` type, we see that these two groups in particular(single-family/multi-family) occupy higher priced homes due to their in-part also occupying homes with greater number of rooms, helping us further visualize the reasoning behind why the distribution above looked the way it did.    
+
+
+```{r, fig.width=10, fig.height=8}
+housingData %>% ggplot(aes(desc, price, fill = factor(totalrooms))) +
+  geom_boxplot() +
+  stat_summary(fun.y=mean, geom="point", shape=3, size=5, color="red", fill="red") +
+  labs(title = "Total Rooms Broken-down By Desc", subtitle = "Collapsed Distributions of Multi & Single Family Pulled Above Others By Higher Numbers of Rooms") +
+  xlab("Description of Residence") +
+  ylab("Price")
+```
+
+With an understanding of those variables and their relationship to the response, we'll continue to investigate the more numerically inclined variables, including:   
+`numstories`, `yearbuilt`, `basement`, `bedrooms`, `bathrooms`, `fireplaces`, `sqft`, `lotarea`, `zipcode`, `AvgIncome`, and `DistDowntown`
+
+When we investigate our more numerically inclined variables, we can see **very few**, noteworthy relationships with the response(log-response). We can clearly see that as `bedrooms`, `bathrooms`, `fireplaces`, `totalrooms`, and square-footage(`sqft`) rise, so too does our response. 
+
+```{r}
+pairScatterCorr <- housingData %>% select(1, 8, 9, 10, 11, 12)
+pairs(pairScatterCorr, main = "Correlated Variables")
+```
+  
+With other variables such as `lotarea`, `zipcode`, `AvgIncome`, `DistDowntown`, `numstories`, `yearbuilt`, and `basement` appear less correlated with the response. 
+
+```{r}
+pairScatterUnCorr <- housingData %>% select(1, 3, 4, 13, 7, 14, 15, 17)
+pairs(pairScatterUnCorr, main = "Uncorrelated Variables")
+```  
+  
+We can use a correlation matrix plot to further verify that our reading of the relationships between our variables has any merit. We can see that when we order our correlations, we in fact see that the variables we named above are grouped accordingly. We do find some evidence of multi-colinearity, but nothing that appears as to much cause for concern. The vast majority of our data is uncorrelated. For now, we'll continue with the variables as they are.  
+
+```{r}
+corrVars <- select_if(housingData, is.numeric) %>% select(-price) %>% relocate(logprice)
+corr <- round(cor(corrVars), 1)
+ggcorrplot(corr, hc.order = TRUE, type = "lower", lab = TRUE,outline.col = "white", title = "Correlation Matrix")
+```
+
+---   
+
+## Modeling   
+
+
+I will choose the performance metric of RMSE(Root Mean Squared Error) primarily for the simple fact that we would like a metric which is in an easily interpretable form (same units as response). When possible, I will be utilizing the caret package's `train()` and `trainControl()` functions, as I found them incredibly useful for cross validation in previous assignments. While our chosen metric is RMSE, we may also consider $R^2$ and Mean Absolute Error($MAE$) metrics as well.  
+
+#### Note on CV:  
+We will elect to use k = 10 with 5 repeats. This should give us a fairly good average for a given test set error rate.  
+
+```{r, warning = FALSE}
+set.seed(100)
+my_ctrl <- caret::trainControl(method = "repeatedcv",
+                               number = 10,
+                               repeats = 5)
+#Define Error Metric
+my_metric <- "RMSE"
+#Remove price so as to not accidentally build models with it
+housingDataTrain <- housingData %>% select(-price)
+```
+
+
+
+**All Models Considered: **   
+
+### Simple Linear Model  
+
+For its sheer simplicity and interpretability, we will elect to build a fairly standard linear model consisting of all variables. After this model is build we will investigate and see if our model and its corresponding variables suffer from a high VIF(variance inflation factor). If so, we'll remove such variables and reassess performance.  
+
+```{r, warning = FALSE}
+set.seed(100)
+lm.fit <- train(logprice ~ ., 
+                  data = housingDataTrain, 
+                  method = "lm", 
+                  metric = my_metric,
+                  trControl = my_ctrl)
+```
+
+
+When investigating, we find that the rooftype actually gives incredibly high variance inflation factors and we would be foolish not to remove it. Other variables having VIF values greater than 5 will also be removed. In a strange turn of events, we might originally believe that removing totalrooms and Location, two seemingly important variables, would hinder model performance. However, upon removing them we find that model performance actually slightly improves. 
+
+```{r}
+vif(lm.fit$finalModel)
+```
+
+With those variables removed, we can rebuild the model and now record the model performance.
+
+```{r, warning = FALSE}
+set.seed(100)
+lm.fit <- train(logprice ~ . - rooftype - totalrooms - Location, 
+                  data = housingDataTrain, 
+                  method = "lm", 
+                  metric = my_metric,
+                  trControl = my_ctrl)
+
+lm.mod.RMSE <- lm.fit$results$RMSE
+print(paste("Linear Model RMSE: " , lm.mod.RMSE))
+varImp(lm.fit)
+```
+
+#### Variance Inflation of new model  
+
+None of our new values are above 5, and so we can be certain we're getting a decent standard linear fit with this model.  
+
+```{r, warning = FALSE}
+vif_values <- vif(lm.fit$finalModel)
+vif_values
+```
+
+### Ridge and Lasso Regularization  
+
+Given that we have very few predictors which appear actually related to the response, we should expect Lasso to do relatively well. Ridge, despite us not expecting it to do as well, will be adding merely for the fact that we need to change a single hyperparameter.  The ability of Ridge and Lasso to perform regularization may given us an even better fit that the standard linear model from before. 
+
+
+```{r, warning = FALSE}
+lambdaseq = 10^seq(-6, 0, by = 0.1)
+set.seed(100)
+ridge.mod <- train(logprice ~ .,
+                   data = housingDataTrain,
+                   method = "glmnet",
+                   metric = my_metric,
+                   preProc = c("center", "scale"),
+                   trControl = my_ctrl,
+                   tuneGrid = expand.grid(alpha=0,
+                                          lambda=lambdaseq))
+
+set.seed(100)
+lasso.mod <- train(logprice ~ .,
+                   data = housingDataTrain,
+                   method = "glmnet",
+                   metric = my_metric,
+                   preProc = c("center", "scale"),
+                   trControl = my_ctrl,
+                   tuneGrid = expand.grid(alpha=1,
+                                          lambda=lambdaseq))
+
+#After we perform our cross validation, we'll take the minimum RMSE by identifying the best tuned model's performance.  
+ridge.mod.RMSE <- min(ridge.mod$results$RMSE)
+lasso.mod.RMSE <- min(lasso.mod$results$RMSE)
+
+print(paste("Ridge Model RMSE: ", ridge.mod.RMSE))
+print(paste("Lasso Model RMSE: ", lasso.mod.RMSE))
+
+
+varImp(ridge.mod)
+varImp(lasso.mod)
+```
+
+### Stepwise Selection  
+
+Throughout EDA, we formed certain assumptions around which variables we found to be most important according to corresponding statistics and relationships with the response. We should perform best subset/stepwise selection as possible affirmation of our previous findings. Personally, I mainly wanted to see if step wise selection would find the same variables important as we did during EDA.
+
+```{r}
+set.seed(100)
+step.mod <- train(logprice ~ .,
+                  data = housingDataTrain,
+                  method = "lmStepAIC",
+                  trace = FALSE,
+                  metric = my_metric,
+                  trControl = my_ctrl)
+
+#Final Model
+#step.mod$finalModel
+step.mod.RMSE <- step.mod$results$RMSE
+step.mod$finalModel
+varImp(step.mod)
+```
+
+**Interesting point: **  
+
+From our previous intuition about which variables seemed most important, step-wise selection actually ended up selecting `bedrooms`, `bathrooms`, `fireplaces`, and square-footage(`sqft`). It *did*, however, leave out `totalrooms`. If may be the case as with the previous linear model we found that step-wise determined that its inclusion in the model building process hindered more than it help and so elected to remove it as we previously did.  
+
+### PCA & PLS 
+
+By reducing the dimensionality of our dataset, we may be able to capture some of the most important relationships in our dataset through a linear transformation of variables.  
+
+```{r, warning = FALSE}
+set.seed(100)
+pcr.mod <- train(logprice ~ .,
+                 data = housingDataTrain,
+                 method = "pcr",
+                 metric = my_metric,
+                 tuneLength = 5,
+                 preProc = c("center", "scale"),
+                 trControl = my_ctrl)
+
+
+set.seed(100)
+pls.mod <- train(logprice ~ .,
+                 data = housingDataTrain,
+                 method = "pls",
+                 metric = my_metric,
+                 tuneLength = 5,
+                 preProc = c("center", "scale"),
+                 trControl = my_ctrl)
+
+pcr.mod.RMSE <- pcr.mod$results$RMSE[5]
+pls.mod.RMSE <- pcr.mod$results$RMSE[5]
+
+varImp(pcr.mod)
+varImp(pls.mod)
+```
+
+
+### Random Forest    
+
+The predictive performance and interpretability of trees should not be understated and doubly for random forests. Not only may we get superb predictive performance at the cost of slight interpretability, but we can additionally find which variables were most important in determining the overall predictions. 
+
+```{r}
+set.seed(100)
+random.forest.mod <- train(logprice ~ .,
+                           data = housingDataTrain,
+                           method = "rf", 
+                           metric = my_metric,
+                           importance = TRUE,
+                           tuneGrid = expand.grid(.mtry = seq(3,7,1)),
+                           trControl = my_ctrl)
+
+random.forest.mod.RMSE <- min(random.forest.mod$results$RMSE)
+plot(varImp(random.forest.mod))
+plot(random.forest.mod)
+```   
+
+We find that even our non-tuned mtry values outperform all other models. 
+
+--- 
+
+### Results   
+
+```{r}
+results <- resamples(list(SLR = lm.fit,
+                     Ridge = ridge.mod,
+                     Lasso = lasso.mod,
+                     Stepwise = step.mod,
+                     PLS = pls.mod,
+                     PCR = pcr.mod,
+                     RandomForest = random.forest.mod))
+
+dotplot(results, main = "Model Evaluation")
+```
+
+ 
+```{r, warning = FALSE}
+resultsFrame <- data.frame(
+  "Method" = c("Simple Linear Regression", "Lasso", "Ridge", "PCR", "PLS", "Stepwise", "Random Forest"),
+  "RMSE" = c(lm.mod.RMSE, ridge.mod.RMSE, lasso.mod.RMSE, pcr.mod.RMSE, pls.mod.RMSE, step.mod.RMSE, random.forest.mod.RMSE)
+)
+
+resultsFrame[order(resultsFrame["RMSE"]),]
+```
+
+### Model RMSE Comparison  
+
+We find that all but one of our models(random forest), perform within one-standard error of one another. If we were to elect to choose between one of these, we would more than likely select either Lasso or step wise, due to its ease of interpretation boiling down to mere variable selection.  
+
+However, the random forest model outperforms all other models in terms of our chosen metric, RMSE. Not only that, it also outperforms all other models in terms of MAE and R-squared as well. While the random forest may not be as interpretable to the same extent as the other models, its variable importance graph shows us it found similar variables important in-line with the other models.    
+
+For this reason, we will elect to use our random forest model in making predictions.   
+
+---  
+
+### Predictions - CSV File Generation
+
+```{r}
+#Import Test Data Set 
+testSet <- read.csv("test.csv", sep = ",", header = TRUE) %>% mutate_if(is.character, as.factor)
+testSet %>% glimpse()
+```
+
+**We have to be sure to apply our transformations to our variables in the same way that we did with the training data set** 
+
+
+#### Very Important:  
+After we make our predictions, we should convert those prices back to the normal range of values using the `exp()` function...
+
+```{r}
+predPrices <- random.forest.mod %>% predict(testSet)
+#Remove names and convert using exp() since we predicted using logprices
+prices <- exp(unname(predPrices))
+
+predictionDF <- data.frame(
+  id = testSet$id,
+  price = prices
+)
+``` 
+
+```{r}
+plot(fitted(random.forest.mod), resid(random.forest.mod), xlab ="Fitted Values", ylab = "Residual Values", main = "Residual Plot of Values")
+abline(0,0)
+```
+
+#### Export to CSV File
+
+```{r}
+write.csv(predictionDF, "C:\\Users\\clark\\OneDrive\\Desktop\\Stat 1361 - Final Project\\testing_predictions_Necciai_Clark_CPN14.csv", row.names = FALSE)
+```
